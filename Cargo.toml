@@ -11,6 +11,9 @@ exchanges.workspace = true
 tokio = { version = "1.44.1", features = ["rt-multi-thread", "signal"] }
 anyhow = "1.0.97"
 env_logger = "0.11.7"
+toml = "0.5"
+log.workspace = true
+serde.workspace = true
 
 [workspace]
 members = [ "exchanges"]

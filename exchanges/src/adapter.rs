@@ -44,6 +44,20 @@ pub enum MarketType {
     LinearPerps,
 }
 
+impl std::str::FromStr for MarketType {
+    type Err = StreamError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "spot" => Ok(MarketType::Spot),
+            "linear_perps" => Ok(MarketType::LinearPerps),
+            _ => Err(StreamError::InvalidRequest(
+                "Invalid market type".to_string(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum StreamType {
     Kline {

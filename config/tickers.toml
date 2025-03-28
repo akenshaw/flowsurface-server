@@ -1,0 +1,2 @@
+market_type = "linear_perps"
+tickers = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]

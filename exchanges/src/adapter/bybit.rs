@@ -66,8 +66,8 @@ pub struct SonicKline {
 
 #[derive(Debug)]
 enum StreamData {
-    Trade(Vec<SonicTrade>),
-    Depth(SonicDepth, String, u64),
+    Trade(Ticker, Vec<SonicTrade>),
+    Depth(Ticker, SonicDepth, String, u64),
     Kline(Ticker, Vec<SonicKline>),
 }
 
@@ -80,20 +80,39 @@ enum StreamName {
 }
 
 impl StreamName {
-    fn from_topic(topic: &str, is_ticker: Option<Ticker>, market_type: MarketType) -> Self {
+    fn from_topic(topic: &str, market_type: MarketType) -> Self {
         let parts: Vec<&str> = topic.split('.').collect();
 
-        if let Some(ticker_str) = parts.last() {
-            let ticker = is_ticker.unwrap_or_else(|| Ticker::new(ticker_str, market_type));
+        if parts.is_empty() {
+            return StreamName::Unknown;
+        }
 
-            match parts.first() {
-                Some(&"publicTrade") => StreamName::Trade(ticker),
-                Some(&"orderbook") => StreamName::Depth(ticker),
-                Some(&"kline") => StreamName::Kline(ticker),
-                _ => StreamName::Unknown,
+        match parts[0] {
+            "publicTrade" => {
+                if parts.len() >= 2 {
+                    let ticker = Ticker::new(parts[1], market_type);
+                    StreamName::Trade(ticker)
+                } else {
+                    StreamName::Unknown
+                }
             }
-        } else {
-            StreamName::Unknown
+            "orderbook" => {
+                if parts.len() >= 3 {
+                    let ticker = Ticker::new(parts[2], market_type);
+                    StreamName::Depth(ticker)
+                } else {
+                    StreamName::Unknown
+                }
+            }
+            "kline" => {
+                if parts.len() >= 3 {
+                    let ticker = Ticker::new(parts[2], market_type);
+                    StreamName::Kline(ticker)
+                } else {
+                    StreamName::Unknown
+                }
+            }
+            _ => StreamName::Unknown,
         }
     }
 }
@@ -106,16 +125,12 @@ enum StreamWrapper {
 }
 
 #[allow(unused_assignments)]
-fn feed_de(
-    slice: &[u8],
-    ticker: Option<Ticker>,
-    market_type: MarketType,
-) -> Result<StreamData, StreamError> {
+fn feed_de(slice: &[u8], market_type: MarketType) -> Result<StreamData, StreamError> {
     let mut stream_type: Option<StreamWrapper> = None;
     let mut depth_wrap: Option<SonicDepth> = None;
 
     let mut data_type = String::new();
-    let mut topic_ticker: Option<Ticker> = ticker;
+    let mut topic_ticker: Option<Ticker> = None;
 
     let iter: sonic_rs::ObjectJsonIter = unsafe { to_object_iter_unchecked(slice) };
 
@@ -124,13 +139,7 @@ fn feed_de(
 
         if k == "topic" {
             if let Some(val) = v.as_str() {
-                let mut is_ticker = None;
-
-                if let Some(t) = ticker {
-                    is_ticker = Some(t);
-                }
-
-                match StreamName::from_topic(val, is_ticker, market_type) {
+                match StreamName::from_topic(val, market_type) {
                     StreamName::Depth(t) => {
                         stream_type = Some(StreamWrapper::Depth);
                         topic_ticker = Some(t);
@@ -156,7 +165,10 @@ fn feed_de(
                     let trade_wrap: Vec<SonicTrade> = sonic_rs::from_str(&v.as_raw_faststr())
                         .map_err(|e| StreamError::ParseError(e.to_string()))?;
 
-                    return Ok(StreamData::Trade(trade_wrap));
+                    return Ok(StreamData::Trade(
+                        topic_ticker.expect("couldnt get ticker topic"),
+                        trade_wrap,
+                    ));
                 }
                 Some(StreamWrapper::Depth) => {
                     if depth_wrap.is_none() {
@@ -193,7 +205,12 @@ fn feed_de(
                     .as_u64()
                     .ok_or_else(|| StreamError::ParseError("Failed to parse u64".to_string()))?;
 
-                return Ok(StreamData::Depth(dw, data_type.to_string(), time));
+                return Ok(StreamData::Depth(
+                    topic_ticker.expect("couldnt get ticker topic"),
+                    dw,
+                    data_type.to_string(),
+                    time,
+                ));
             }
         }
     }
@@ -261,34 +278,55 @@ async fn try_connect(
     }
 }
 
-pub fn connect_market_stream(ticker: Ticker) -> impl Stream<Item = Event> {
+pub fn connect_market_stream(
+    tickers: Vec<Ticker>,
+    market_type: MarketType,
+) -> impl Stream<Item = Event> {
     super::channel(100, async move |mut output| {
         let mut state: State = State::Disconnected;
-
-        let (symbol_str, market_type) = ticker.get_string();
 
         let exchange = match market_type {
             MarketType::Spot => Exchange::BybitSpot,
             MarketType::LinearPerps => Exchange::BybitLinear,
         };
 
-        let stream_1 = format!("publicTrade.{symbol_str}");
-        let stream_2 = format!(
-            "orderbook.{}.{}",
-            match market_type {
-                MarketType::Spot => "200",
-                MarketType::LinearPerps => "500",
-            },
-            symbol_str,
-        );
+        let trade_stream_args: Vec<String> = tickers
+            .iter()
+            .map(|t| format!("publicTrade.{}", t.get_string().0))
+            .collect::<Vec<String>>();
+
+        let book_stream_args: Vec<String> = tickers
+            .iter()
+            .map(|t| {
+                format!(
+                    "orderbook.{}.{}",
+                    match market_type {
+                        MarketType::Spot => "200",
+                        MarketType::LinearPerps => "500",
+                    },
+                    t.get_string().0
+                )
+            })
+            .collect::<Vec<String>>();
+
+        let mut stream_args = Vec::new();
+        stream_args.extend(trade_stream_args);
+        stream_args.extend(book_stream_args);
 
         let subscribe_message = serde_json::json!({
             "op": "subscribe",
-            "args": [stream_1, stream_2]
+            "args": stream_args
         });
 
-        let mut trades_buffer: Vec<Trade> = Vec::new();
-        let mut orderbook = LocalDepthCache::new();
+        dbg!(&subscribe_message);
+
+        let mut trades_buffers: HashMap<Ticker, Vec<Trade>> = HashMap::new();
+        let mut orderbooks: HashMap<Ticker, LocalDepthCache> = HashMap::new();
+
+        for ticker in &tickers {
+            trades_buffers.insert(ticker.clone(), Vec::new());
+            orderbooks.insert(ticker.clone(), LocalDepthCache::new());
+        }
 
         loop {
             match &mut state {
@@ -298,63 +336,78 @@ pub fn connect_market_stream(ticker: Ticker) -> impl Stream<Item = Event> {
                 State::Connected(websocket) => match websocket.read_frame().await {
                     Ok(msg) => match msg.opcode {
                         OpCode::Text => {
-                            if let Ok(data) = feed_de(&msg.payload[..], Some(ticker), market_type) {
-                                match data {
-                                    StreamData::Trade(de_trade_vec) => {
-                                        for de_trade in &de_trade_vec {
-                                            let trade = Trade {
-                                                time: de_trade.time,
-                                                is_sell: de_trade.is_sell == "Sell",
-                                                price: de_trade.price,
-                                                qty: de_trade.qty,
-                                            };
+                            match feed_de(&msg.payload[..], market_type) {
+                                Ok(data) => match data {
+                                    StreamData::Trade(ticker, de_trade_vec) => {
+                                        if let Some(buffer) = trades_buffers.get_mut(&ticker) {
+                                            for de_trade in &de_trade_vec {
+                                                let trade = Trade {
+                                                    time: de_trade.time,
+                                                    is_sell: de_trade.is_sell == "Sell",
+                                                    price: de_trade.price,
+                                                    qty: de_trade.qty,
+                                                };
 
-                                            trades_buffer.push(trade);
+                                                buffer.push(trade);
+                                            }
                                         }
                                     }
-                                    StreamData::Depth(de_depth, data_type, time) => {
-                                        let depth_update = TempLocalDepth {
-                                            last_update_id: de_depth.update_id,
-                                            time,
-                                            bids: de_depth
-                                                .bids
-                                                .iter()
-                                                .map(|x| Order {
-                                                    price: x.price,
-                                                    qty: x.qty,
-                                                })
-                                                .collect(),
-                                            asks: de_depth
-                                                .asks
-                                                .iter()
-                                                .map(|x| Order {
-                                                    price: x.price,
-                                                    qty: x.qty,
-                                                })
-                                                .collect(),
-                                        };
+                                    StreamData::Depth(ticker, de_depth, data_type, time) => {
+                                        if let Some(orderbook) = orderbooks.get_mut(&ticker) {
+                                            let depth_update = TempLocalDepth {
+                                                last_update_id: de_depth.update_id,
+                                                time,
+                                                bids: de_depth
+                                                    .bids
+                                                    .iter()
+                                                    .map(|x| Order {
+                                                        price: x.price,
+                                                        qty: x.qty,
+                                                    })
+                                                    .collect(),
+                                                asks: de_depth
+                                                    .asks
+                                                    .iter()
+                                                    .map(|x| Order {
+                                                        price: x.price,
+                                                        qty: x.qty,
+                                                    })
+                                                    .collect(),
+                                            };
 
-                                        if (data_type == "snapshot")
-                                            || (depth_update.last_update_id == 1)
-                                        {
-                                            orderbook.fetched(&depth_update);
-                                        } else if data_type == "delta" {
-                                            orderbook.update_depth_cache(&depth_update);
+                                            if (data_type == "snapshot")
+                                                || (depth_update.last_update_id == 1)
+                                            {
+                                                orderbook.fetched(&depth_update);
+                                            } else if data_type == "delta" {
+                                                orderbook.update_depth_cache(&depth_update);
 
-                                            let _ = output
-                                                .send(Event::DepthReceived(
-                                                    StreamType::DepthAndTrades { exchange, ticker },
-                                                    time,
-                                                    orderbook.get_depth(),
-                                                    std::mem::take(&mut trades_buffer)
-                                                        .into_boxed_slice(),
-                                                ))
-                                                .await;
+                                                // Get trades for this ticker
+                                                if let Some(trades) =
+                                                    trades_buffers.get_mut(&ticker)
+                                                {
+                                                    let _ = output
+                                                        .send(Event::DepthReceived(
+                                                            StreamType::DepthAndTrades {
+                                                                exchange,
+                                                                ticker,
+                                                            },
+                                                            time,
+                                                            orderbook.get_depth(),
+                                                            std::mem::take(trades)
+                                                                .into_boxed_slice(),
+                                                        ))
+                                                        .await;
+                                                }
+                                            }
                                         }
                                     }
                                     _ => {
                                         log::warn!("Unknown data: {:?}", &data);
                                     }
+                                },
+                                Err(e) => {
+                                    log::error!("Failed to parse data: {}", e);
                                 }
                             }
                         }
@@ -418,7 +471,7 @@ pub fn connect_kline_stream(
                     Ok(msg) => match msg.opcode {
                         OpCode::Text => {
                             if let Ok(StreamData::Kline(ticker, de_kline_vec)) =
-                                feed_de(&msg.payload[..], None, market_type)
+                                feed_de(&msg.payload[..], market_type)
                             {
                                 for de_kline in &de_kline_vec {
                                     let kline = Kline {

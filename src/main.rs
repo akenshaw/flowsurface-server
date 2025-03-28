@@ -1,9 +1,14 @@
+use std::str::FromStr;
+
 use anyhow::Result;
+use config::Config;
 use exchanges::Ticker;
-use exchanges::adapter::bybit::connect_market_stream;
 use exchanges::adapter::{Event, MarketType};
+use exchanges::adapter::{binance, bybit};
 use futures::{Stream, StreamExt};
 use tokio::signal;
+
+mod config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -11,10 +16,20 @@ async fn main() -> Result<()> {
 
     println!("Starting Flowsurface server...");
 
-    let ticker = Ticker::new("BTCUSDT", MarketType::Spot);
-    println!("Connecting to market stream for {}", ticker.get_string().0);
+    let config: Config =
+        Config::from_file("./config/tickers.toml").expect("Failed to load config file");
 
-    let stream = connect_market_stream(ticker);
+    println!("{:?}", &config);
+
+    let market_type = MarketType::from_str(&config.market_type)?;
+
+    let book_tickers: Vec<Ticker> = config
+        .tickers
+        .iter()
+        .map(|ticker| Ticker::new(ticker, market_type))
+        .collect();
+
+    let stream = bybit::connect_market_stream(book_tickers, market_type);
     let pinned_stream = Box::pin(stream);
 
     tokio::select! {
@@ -48,8 +63,8 @@ where
                     trades.len()
                 );
             }
-            _ => {
-                println!("Received event: {:?}", event);
+            Event::KlineReceived(stream_type, kline) => {
+                println!("{} -- Received kline update: {}", stream_type, kline.close,);
             }
         }
     }
