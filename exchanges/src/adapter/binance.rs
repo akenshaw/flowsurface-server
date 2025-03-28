@@ -76,6 +76,8 @@ struct SonicKlineWrap {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SonicTrade {
+    #[serde(rename = "s")]
+    symbol: String,
     #[serde(rename = "T")]
     time: u64,
     #[serde(rename = "p", deserialize_with = "de_string_to_f32")]
@@ -94,6 +96,8 @@ enum SonicDepth {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SpotDepth {
+    #[serde(rename = "s")]
+    symbol: String,
     #[serde(rename = "E")]
     time: u64,
     #[serde(rename = "U")]
@@ -108,6 +112,8 @@ struct SpotDepth {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct LinearPerpDepth {
+    #[serde(rename = "s")]
+    symbol: String,
     #[serde(rename = "T")]
     time: u64,
     #[serde(rename = "U")]
@@ -122,10 +128,22 @@ struct LinearPerpDepth {
     asks: Vec<Order>,
 }
 
+impl std::fmt::Display for LinearPerpDepth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} Linear Perp Depth: {} bids, {} asks",
+            self.symbol,
+            self.bids.len(),
+            self.asks.len()
+        )
+    }
+}
+
 #[derive(Debug)]
 enum StreamData {
-    Trade(SonicTrade),
-    Depth(SonicDepth),
+    Trade(Ticker, SonicTrade),
+    Depth(Ticker, SonicDepth),
     Kline(Ticker, SonicKline),
 }
 
@@ -166,20 +184,26 @@ fn feed_de(slice: &[u8], market: MarketType) -> Result<StreamData, StreamError> 
                     let trade: SonicTrade = sonic_rs::from_str(&v.as_raw_faststr())
                         .map_err(|e| StreamError::ParseError(e.to_string()))?;
 
-                    return Ok(StreamData::Trade(trade));
+                    return Ok(StreamData::Trade(Ticker::new(&trade.symbol, market), trade));
                 }
                 Some(StreamWrapper::Depth) => match market {
                     MarketType::Spot => {
                         let depth: SpotDepth = sonic_rs::from_str(&v.as_raw_faststr())
                             .map_err(|e| StreamError::ParseError(e.to_string()))?;
 
-                        return Ok(StreamData::Depth(SonicDepth::Spot(depth)));
+                        return Ok(StreamData::Depth(
+                            Ticker::new(&depth.symbol, market),
+                            SonicDepth::Spot(depth),
+                        ));
                     }
                     MarketType::LinearPerps => {
                         let depth: LinearPerpDepth = sonic_rs::from_str(&v.as_raw_faststr())
                             .map_err(|e| StreamError::ParseError(e.to_string()))?;
 
-                        return Ok(StreamData::Depth(SonicDepth::LinearPerp(depth)));
+                        return Ok(StreamData::Depth(
+                            Ticker::new(&depth.symbol, market),
+                            SonicDepth::LinearPerp(depth),
+                        ));
                     }
                 },
                 Some(StreamWrapper::Kline) => {
@@ -259,26 +283,38 @@ async fn try_resync(
 }
 
 #[allow(unused_assignments)]
-pub fn connect_market_stream(ticker: Ticker) -> impl Stream<Item = Event> {
+pub fn connect_market_stream(
+    tickers: Vec<Ticker>,
+    market: MarketType,
+) -> impl Stream<Item = Event> {
     super::channel(100, async move |mut output| {
         let mut state = State::Disconnected;
-
-        let (symbol_str, market) = ticker.get_string();
 
         let exchange = match market {
             MarketType::Spot => Exchange::BinanceSpot,
             MarketType::LinearPerps => Exchange::BinanceFutures,
         };
 
-        let stream_1 = format!("{}@aggTrade", symbol_str.to_lowercase());
-        let stream_2 = format!("{}@depth@100ms", symbol_str.to_lowercase());
+        let streams = tickers
+            .iter()
+            .map(|ticker| {
+                let symbol_str = ticker.get_string().0;
+                format!(
+                    "{}@aggTrade/{}@depth@100ms",
+                    symbol_str.to_lowercase(),
+                    symbol_str.to_lowercase(),
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("/");
 
-        let mut orderbook: LocalDepthCache = LocalDepthCache::new();
-        let mut trades_buffer: Vec<Trade> = Vec::new();
-        let mut already_fetching: bool = false;
-        let mut prev_id: u64 = 0;
+        let mut trades_buffers: HashMap<Ticker, Vec<Trade>> = HashMap::new();
+        let mut orderbooks: HashMap<Ticker, (LocalDepthCache, bool, u64)> = HashMap::new();
 
-        let streams = format!("{stream_1}/{stream_2}");
+        for ticker in &tickers {
+            trades_buffers.insert(ticker.clone(), Vec::new());
+            orderbooks.insert(ticker.clone(), (LocalDepthCache::new(), false, 0));
+        }
 
         let domain = match market {
             MarketType::Spot => "stream.binance.com",
@@ -289,38 +325,9 @@ pub fn connect_market_stream(ticker: Ticker) -> impl Stream<Item = Event> {
             match &mut state {
                 State::Disconnected => {
                     if let Ok(websocket) = connect(domain, streams.as_str()).await {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        state = State::Connected(websocket);
 
-                        tokio::spawn(async move {
-                            let result = fetch_depth(&ticker).await;
-                            let _ = tx.send(result);
-                        });
-                        match rx.await {
-                            Ok(Ok(depth)) => {
-                                orderbook.fetched(&depth);
-                                prev_id = 0;
-
-                                state = State::Connected(websocket);
-
-                                let _ = output.send(Event::Connected(exchange, Connection)).await;
-                            }
-                            Ok(Err(e)) => {
-                                let _ = output
-                                    .send(Event::Disconnected(
-                                        exchange,
-                                        format!("Depth fetch failed: {e}"),
-                                    ))
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = output
-                                    .send(Event::Disconnected(
-                                        exchange,
-                                        format!("Channel error: {e}"),
-                                    ))
-                                    .await;
-                            }
-                        }
+                        let _ = output.send(Event::Connected(exchange, Connection)).await;
                     } else {
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
@@ -338,137 +345,174 @@ pub fn connect_market_stream(ticker: Ticker) -> impl Stream<Item = Event> {
                             OpCode::Text => {
                                 if let Ok(data) = feed_de(&msg.payload[..], market) {
                                     match data {
-                                        StreamData::Trade(de_trade) => {
-                                            let trade = Trade {
-                                                time: de_trade.time,
-                                                is_sell: de_trade.is_sell,
-                                                price: de_trade.price,
-                                                qty: de_trade.qty,
-                                            };
+                                        StreamData::Trade(ticker, de_trade) => {
+                                            if let Some(buffer) = trades_buffers.get_mut(&ticker) {
+                                                let trade = Trade {
+                                                    time: de_trade.time,
+                                                    is_sell: de_trade.is_sell,
+                                                    price: de_trade.price,
+                                                    qty: de_trade.qty,
+                                                };
 
-                                            trades_buffer.push(trade);
-                                        }
-                                        StreamData::Depth(depth_type) => {
-                                            if already_fetching {
-                                                log::warn!("Already fetching...\n");
-                                                continue;
+                                                buffer.push(trade);
                                             }
-
-                                            let last_update_id = orderbook.get_fetch_id();
-
-                                            match depth_type {
-                                                SonicDepth::LinearPerp(ref de_depth) => {
-                                                    if (de_depth.final_id <= last_update_id)
-                                                        || last_update_id == 0
-                                                    {
-                                                        continue;
-                                                    }
-
-                                                    if prev_id == 0
-                                                        && (de_depth.first_id > last_update_id + 1)
-                                                        || (last_update_id + 1 > de_depth.final_id)
-                                                    {
-                                                        log::warn!(
-                                                            "Out of sync at first event. Trying to resync...\n"
-                                                        );
-
-                                                        try_resync(
-                                                            exchange,
-                                                            ticker,
-                                                            &mut orderbook,
-                                                            &mut state,
-                                                            &mut output,
-                                                            &mut already_fetching,
-                                                        )
-                                                        .await;
-                                                    }
-
-                                                    if (prev_id == 0)
-                                                        || (prev_id == de_depth.prev_final_id)
-                                                    {
-                                                        orderbook.update_depth_cache(
-                                                            &new_depth_cache(&depth_type),
-                                                        );
-
-                                                        let _ = output
-                                                            .send(Event::DepthReceived(
-                                                                StreamType::DepthAndTrades {
-                                                                    exchange,
-                                                                    ticker,
-                                                                },
-                                                                de_depth.time,
-                                                                orderbook.get_depth(),
-                                                                std::mem::take(&mut trades_buffer)
-                                                                    .into_boxed_slice(),
-                                                            ))
-                                                            .await;
-
-                                                        prev_id = de_depth.final_id;
-                                                    } else {
-                                                        state = State::Disconnected;
-                                                        let _ = output.send(
-                                                                Event::Disconnected(
-                                                                    exchange,
-                                                                    format!("Out of sync. Expected update_id: {}, got: {}", de_depth.prev_final_id, prev_id)
-                                                                )
-                                                            ).await;
-                                                    }
+                                        }
+                                        StreamData::Depth(ticker, depth_type) => {
+                                            if let Some((orderbook, already_fetching, prev_id)) =
+                                                orderbooks.get_mut(&ticker)
+                                            {
+                                                if *already_fetching {
+                                                    continue;
                                                 }
-                                                SonicDepth::Spot(ref de_depth) => {
-                                                    if (de_depth.final_id <= last_update_id)
-                                                        || last_update_id == 0
-                                                    {
-                                                        continue;
-                                                    }
 
-                                                    if prev_id == 0
-                                                        && (de_depth.first_id > last_update_id + 1)
-                                                        || (last_update_id + 1 > de_depth.final_id)
-                                                    {
-                                                        log::warn!(
-                                                            "Out of sync at first event. Trying to resync...\n"
-                                                        );
+                                                let last_update_id = orderbook.get_fetch_id();
 
-                                                        try_resync(
-                                                            exchange,
-                                                            ticker,
-                                                            &mut orderbook,
-                                                            &mut state,
-                                                            &mut output,
-                                                            &mut already_fetching,
-                                                        )
-                                                        .await;
-                                                    }
-
-                                                    if (prev_id == 0)
-                                                        || (prev_id == de_depth.first_id - 1)
-                                                    {
-                                                        orderbook.update_depth_cache(
-                                                            &new_depth_cache(&depth_type),
-                                                        );
-
-                                                        let _ = output
-                                                            .send(Event::DepthReceived(
-                                                                StreamType::DepthAndTrades {
-                                                                    exchange,
-                                                                    ticker,
-                                                                },
-                                                                de_depth.time,
-                                                                orderbook.get_depth(),
-                                                                std::mem::take(&mut trades_buffer)
-                                                                    .into_boxed_slice(),
-                                                            ))
+                                                match depth_type {
+                                                    SonicDepth::LinearPerp(ref de_depth) => {
+                                                        if last_update_id == 0 {
+                                                            try_resync(
+                                                                exchange,
+                                                                ticker,
+                                                                orderbook,
+                                                                &mut state,
+                                                                &mut output,
+                                                                already_fetching,
+                                                            )
                                                             .await;
+                                                        }
 
-                                                        prev_id = de_depth.final_id;
-                                                    } else {
-                                                        state = State::Disconnected;
-                                                        let _ = output.send(
-                                                                Event::Disconnected(
-                                                                    exchange,
-                                                                    format!("Out of sync. Expected update_id: {}, got: {}", de_depth.final_id, prev_id)
-                                                                )
-                                                            ).await;
+                                                        if de_depth.final_id <= last_update_id {
+                                                            continue;
+                                                        }
+
+                                                        if *prev_id == 0
+                                                            && (de_depth.first_id
+                                                                > last_update_id + 1)
+                                                            || (last_update_id + 1
+                                                                > de_depth.final_id)
+                                                        {
+                                                            log::warn!(
+                                                                "Out of sync at first event. Trying to resync...\n"
+                                                            );
+
+                                                            try_resync(
+                                                                exchange,
+                                                                ticker,
+                                                                orderbook,
+                                                                &mut state,
+                                                                &mut output,
+                                                                already_fetching,
+                                                            )
+                                                            .await;
+                                                        }
+
+                                                        if (*prev_id == 0)
+                                                            || (*prev_id == de_depth.prev_final_id)
+                                                        {
+                                                            orderbook.update_depth_cache(
+                                                                &new_depth_cache(&depth_type),
+                                                            );
+
+                                                            if let Some(buffer) =
+                                                                trades_buffers.get_mut(&ticker)
+                                                            {
+                                                                let _ = output
+                                                                    .send(Event::DepthReceived(
+                                                                        StreamType::DepthAndTrades {
+                                                                            exchange,
+                                                                            ticker,
+                                                                        },
+                                                                        de_depth.time,
+                                                                        orderbook.get_depth(),
+                                                                        std::mem::take(buffer)
+                                                                            .into_boxed_slice(),
+                                                                    ))
+                                                                    .await;
+                                                            }
+
+                                                            *prev_id = de_depth.final_id;
+                                                        } else {
+                                                            state = State::Disconnected;
+                                                            let _ = output.send(
+                                                                    Event::Disconnected(
+                                                                        exchange,
+                                                                        format!("Out of sync. Expected update_id: {}, got: {}", de_depth.prev_final_id, prev_id)
+                                                                    )
+                                                                ).await;
+                                                        }
+                                                    }
+                                                    SonicDepth::Spot(ref de_depth) => {
+                                                        if last_update_id == 0 {
+                                                            try_resync(
+                                                                exchange,
+                                                                ticker,
+                                                                orderbook,
+                                                                &mut state,
+                                                                &mut output,
+                                                                already_fetching,
+                                                            )
+                                                            .await;
+                                                        }
+
+                                                        if de_depth.final_id <= last_update_id {
+                                                            continue;
+                                                        }
+
+                                                        if *prev_id == 0
+                                                            && (de_depth.first_id
+                                                                > last_update_id + 1)
+                                                            || (last_update_id + 1
+                                                                > de_depth.final_id)
+                                                        {
+                                                            log::warn!(
+                                                                "Out of sync at first event. Trying to resync...\n"
+                                                            );
+
+                                                            try_resync(
+                                                                exchange,
+                                                                ticker,
+                                                                orderbook,
+                                                                &mut state,
+                                                                &mut output,
+                                                                already_fetching,
+                                                            )
+                                                            .await;
+                                                        }
+
+                                                        if (*prev_id == 0)
+                                                            || (*prev_id == de_depth.first_id - 1)
+                                                        {
+                                                            orderbook.update_depth_cache(
+                                                                &new_depth_cache(&depth_type),
+                                                            );
+
+                                                            if let Some(buffer) =
+                                                                trades_buffers.get_mut(&ticker)
+                                                            {
+                                                                let _ = output
+                                                                    .send(Event::DepthReceived(
+                                                                        StreamType::DepthAndTrades {
+                                                                            exchange,
+                                                                            ticker,
+                                                                        },
+                                                                        de_depth.time,
+                                                                        orderbook.get_depth(),
+                                                                        std::mem::take(buffer)
+                                                                            .into_boxed_slice(),
+                                                                    ))
+                                                                    .await;
+                                                            }
+
+                                                            *prev_id = de_depth.final_id;
+                                                        } else {
+                                                            state = State::Disconnected;
+                                                            let _ = output.send(
+                                                                    Event::Disconnected(
+                                                                        exchange,
+                                                                        format!("Out of sync. Expected update_id: {}, got: {}", de_depth.final_id, prev_id)
+                                                                    )
+                                                                ).await;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -669,6 +713,8 @@ async fn fetch_depth(ticker: &Ticker) -> Result<TempLocalDepth, StreamError> {
         base_url,
         symbol_str.to_uppercase()
     );
+
+    dbg!(&url);
 
     let response = reqwest::get(&url).await.map_err(StreamError::FetchError)?;
     let text = response.text().await.map_err(StreamError::FetchError)?;

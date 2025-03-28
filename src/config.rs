@@ -1,9 +1,22 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub market_type: String,
+    #[serde(default)]
+    pub exchanges: HashMap<String, ExchangeConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ExchangeConfig {
+    #[serde(default)]
+    pub markets: HashMap<String, MarketConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MarketConfig {
+    #[serde(default)]
     pub tickers: Vec<String>,
 }
 
