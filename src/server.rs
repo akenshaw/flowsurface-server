@@ -52,6 +52,23 @@ async fn get_inserter(client: &mut Client) -> Result<clickhouse::insert::Insert<
     client.insert(TABLE_NAME)
 }
 
+pub async fn flush_trades_buffer(
+    client: &mut clickhouse::Client,
+    trades_buffer: &mut HashMap<StreamType, Vec<Trade>>,
+) -> anyhow::Result<()> {
+    let mut inserter = get_inserter(client).await?;
+
+    for (stream_type, trades) in trades_buffer.iter_mut() {
+        if !trades.is_empty() {
+            write_buffer(&mut inserter, stream_type, trades).await?;
+            trades.clear();
+        }
+    }
+
+    inserter.end().await?;
+    Ok(())
+}
+
 async fn write_buffer(
     inserter: &mut clickhouse::insert::Insert<TradeData>,
     stream_type: &StreamType,
@@ -75,22 +92,5 @@ async fn write_buffer(
         }
     }
 
-    Ok(())
-}
-
-pub async fn flush_trades_buffer(
-    client: &mut clickhouse::Client,
-    trades_buffer: &mut HashMap<StreamType, Vec<Trade>>,
-) -> anyhow::Result<()> {
-    let mut inserter = get_inserter(client).await?;
-
-    for (stream_type, trades) in trades_buffer.iter_mut() {
-        if !trades.is_empty() {
-            write_buffer(&mut inserter, stream_type, trades).await?;
-            trades.clear();
-        }
-    }
-
-    inserter.end().await?;
     Ok(())
 }

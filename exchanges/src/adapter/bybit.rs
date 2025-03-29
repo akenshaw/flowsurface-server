@@ -98,6 +98,8 @@ impl StreamName {
             }
             "orderbook" => {
                 if parts.len() >= 3 {
+                    //println!("{:?}, {}", market_type, parts[2]);
+
                     let ticker = Ticker::new(parts[2], market_type);
                     StreamName::Depth(ticker)
                 } else {
@@ -229,6 +231,7 @@ async fn connect(
         match market_type {
             MarketType::Spot => "spot",
             MarketType::LinearPerps => "linear",
+            MarketType::InversePerps => "inverse",
         }
     );
     setup_websocket_connection(domain, tls_stream, &url).await
@@ -242,6 +245,7 @@ async fn try_connect(
     let exchange = match market_type {
         MarketType::Spot => Exchange::BybitSpot,
         MarketType::LinearPerps => Exchange::BybitLinear,
+        MarketType::InversePerps => Exchange::BybitInverse,
     };
 
     match connect("stream.bybit.com", market_type).await {
@@ -288,6 +292,7 @@ pub fn connect_market_stream(
         let exchange = match market_type {
             MarketType::Spot => Exchange::BybitSpot,
             MarketType::LinearPerps => Exchange::BybitLinear,
+            MarketType::InversePerps => Exchange::BybitInverse,
         };
 
         let trade_stream_args: Vec<String> = tickers
@@ -302,7 +307,7 @@ pub fn connect_market_stream(
                     "orderbook.{}.{}",
                     match market_type {
                         MarketType::Spot => "200",
-                        MarketType::LinearPerps => "500",
+                        MarketType::LinearPerps | MarketType::InversePerps => "500",
                     },
                     t.get_string().0
                 )
@@ -317,8 +322,6 @@ pub fn connect_market_stream(
             "op": "subscribe",
             "args": stream_args
         });
-
-        dbg!(&subscribe_message);
 
         let mut trades_buffers: HashMap<Ticker, Vec<Trade>> = HashMap::new();
         let mut orderbooks: HashMap<Ticker, LocalDepthCache> = HashMap::new();
@@ -447,6 +450,7 @@ pub fn connect_kline_stream(
         let exchange = match market_type {
             MarketType::Spot => Exchange::BybitSpot,
             MarketType::LinearPerps => Exchange::BybitLinear,
+            MarketType::InversePerps => Exchange::BybitInverse,
         };
 
         let stream_str = streams
@@ -674,6 +678,7 @@ pub async fn fetch_klines(
     let market = match market_type {
         MarketType::Spot => "spot",
         MarketType::LinearPerps => "linear",
+        MarketType::InversePerps => "inverse",
     };
 
     let mut url = format!(
@@ -730,6 +735,7 @@ pub async fn fetch_ticksize(
     let market = match market_type {
         MarketType::Spot => "spot",
         MarketType::LinearPerps => "linear",
+        MarketType::InversePerps => "inverse",
     };
 
     let url =
@@ -791,6 +797,7 @@ pub async fn fetch_ticker_prices(
     let (market, volume_threshold) = match market_type {
         MarketType::Spot => ("spot", SPOT_FILTER_VOLUME),
         MarketType::LinearPerps => ("linear", PERP_FILTER_VOLUME),
+        MarketType::InversePerps => ("inverse", PERP_FILTER_VOLUME),
     };
 
     let url = format!("https://api.bybit.com/v5/market/tickers?category={market}");

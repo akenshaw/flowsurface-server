@@ -34,7 +34,6 @@ impl Config {
 }
 
 pub fn setup_exchange_streams<F, S>(
-    exchange_display_name: &str,
     exchange_config: &ExchangeConfig,
     streams: &mut Vec<Pin<Box<dyn Stream<Item = Event> + Send>>>,
     connect_fn: F,
@@ -55,13 +54,6 @@ where
 
             let stream = connect_fn(book_tickers, market_type);
             streams.push(Box::pin(stream) as Pin<Box<dyn Stream<Item = Event> + Send>>);
-
-            println!(
-                "Added {} {} stream with {} tickers",
-                exchange_display_name,
-                market_type_str,
-                market_config.tickers.len()
-            );
         }
     }
 

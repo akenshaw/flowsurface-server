@@ -4,8 +4,7 @@ use exchanges::{
     Trade,
     adapter::{Event, StreamType, binance, bybit},
 };
-use futures::Stream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use std::{collections::HashMap, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -17,7 +16,6 @@ mod server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
     dotenv().ok();
 
     let config: Config =
@@ -28,17 +26,13 @@ async fn main() -> anyhow::Result<()> {
     for (exchange_name, exchange_config) in &config.exchanges {
         match exchange_name.as_str() {
             "binance" => setup_exchange_streams(
-                "Binance",
                 exchange_config,
                 &mut streams,
                 binance::connect_market_stream,
             )?,
-            "bybit" => setup_exchange_streams(
-                "Bybit",
-                exchange_config,
-                &mut streams,
-                bybit::connect_market_stream,
-            )?,
+            "bybit" => {
+                setup_exchange_streams(exchange_config, &mut streams, bybit::connect_market_stream)?
+            }
             _ => println!("Unknown exchange: {}", exchange_name),
         }
     }
@@ -77,7 +71,7 @@ async fn process_trades_buffer(
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let mut trades_buffer: HashMap<StreamType, Vec<Trade>> = HashMap::new();
-    let mut tick_to_write = interval(Duration::from_secs(4));
+    let mut flush_timer = interval(Duration::from_secs(3));
 
     loop {
         tokio::select! {
@@ -87,7 +81,7 @@ async fn process_trades_buffer(
                     .or_default()
                     .extend(trades);
             },
-            _ = tick_to_write.tick() => {
+            _ = flush_timer.tick() => {
                 if let Err(e) = server::flush_trades_buffer(&mut client, &mut trades_buffer).await {
                     eprintln!("Error flushing trades buffer: {}", e);
                 }
