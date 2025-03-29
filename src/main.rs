@@ -1,28 +1,27 @@
-use config::Config;
-use exchanges::Ticker;
-use exchanges::adapter::{Event, MarketType};
-use exchanges::adapter::{binance, bybit};
-use futures::{Stream, StreamExt};
-use std::pin::Pin;
-use std::str::FromStr;
-use tokio::signal;
+use config::{Config, setup_exchange_streams};
+use dotenv::dotenv;
+use exchanges::{
+    Trade,
+    adapter::{Event, StreamType, binance, bybit},
+};
+use futures::Stream;
+use futures::StreamExt;
+use std::{collections::HashMap, time::Duration};
+use tokio::{sync::mpsc, time::interval};
 
 mod config;
+mod server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-
-    println!("Starting Flowsurface server...");
+    dotenv().ok();
 
     let config: Config =
         Config::from_file("./config/tickers.toml").expect("Failed to load config file");
 
-    println!("{:?}", &config);
-
     let mut streams = Vec::new();
 
-    // Process all configured exchanges
     for (exchange_name, exchange_config) in &config.exchanges {
         match exchange_name.as_str() {
             "binance" => setup_exchange_streams(
@@ -43,9 +42,39 @@ async fn main() -> anyhow::Result<()> {
 
     let merged_stream = futures::stream::select_all(streams);
 
+    let mut client = server::create_client();
+
+    let mut tick_to_write = interval(Duration::from_secs(2));
+
+    let (tx, mut rx) = mpsc::channel::<(StreamType, Box<[Trade]>)>(100);
+
     tokio::select! {
-        _ = process_stream(merged_stream) => {},
-        _ = signal::ctrl_c() => {
+        _ = process_stream(merged_stream, tx) => {},
+        _ = async move {
+            let mut trades_buffer: HashMap<StreamType, Vec<Trade>> = HashMap::new();
+
+            loop {
+                tokio::select! {
+                    Some((stream_type, trades)) = rx.recv() => {
+                        trades_buffer
+                            .entry(stream_type)
+                            .or_insert_with(Vec::new)
+                            .extend(trades);
+                    },
+                    _ = tick_to_write.tick() => {
+                        for (stream_type, trades) in trades_buffer.iter_mut() {
+                            if !trades.is_empty() {
+                                if let Err(e) = server::insert_trades(&mut client, *stream_type, trades).await {
+                                    eprintln!("Error inserting trades: {}", e);
+                                }
+                                trades.clear();
+                            }
+                        }
+                    }
+                }
+            }
+        } => {},
+        _ = tokio::signal::ctrl_c() => {
             println!("Received Ctrl+C, shutting down");
         }
     }
@@ -53,42 +82,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn setup_exchange_streams<F, S>(
-    exchange_display_name: &str,
-    exchange_config: &config::ExchangeConfig,
-    streams: &mut Vec<Pin<Box<dyn Stream<Item = Event> + Send>>>,
-    connect_fn: F,
-) -> anyhow::Result<()>
-where
-    S: Stream<Item = Event> + Send + 'static,
-    F: Fn(Vec<Ticker>, MarketType) -> S,
-{
-    for (market_type_str, market_config) in &exchange_config.markets {
-        if !market_config.tickers.is_empty() {
-            let market_type = MarketType::from_str(market_type_str)?;
-
-            let book_tickers: Vec<Ticker> = market_config
-                .tickers
-                .iter()
-                .map(|ticker| Ticker::new(ticker, market_type))
-                .collect();
-
-            let stream = connect_fn(book_tickers, market_type);
-            streams.push(Box::pin(stream) as Pin<Box<dyn Stream<Item = Event> + Send>>);
-
-            println!(
-                "Added {} {} stream with {} tickers",
-                exchange_display_name,
-                market_type_str,
-                market_config.tickers.len()
-            );
-        }
-    }
-
-    Ok(())
-}
-
-async fn process_stream<S>(mut stream: S)
+async fn process_stream<S>(mut stream: S, tx: mpsc::Sender<(StreamType, Box<[Trade]>)>)
 where
     S: Stream<Item = Event> + Unpin,
 {
@@ -100,16 +94,12 @@ where
             Event::Disconnected(exchange, reason) => {
                 println!("Disconnected from {}: {}", exchange, reason);
             }
-            Event::DepthReceived(stream_type, time, depth, trades) => {
-                //println!(
-                //    "{} -- [{}] Received depth update: {} bid/ask levels, {} trades",
-                //    stream_type,
-                //    time,
-                //    depth.bids.len() + depth.asks.len(),
-                //    trades.len()
-                //);
-
-                println!("{stream_type}")
+            Event::DepthReceived(stream_type, _, _, trades) => {
+                if !trades.is_empty() {
+                    if let Err(e) = tx.send((*stream_type, trades.clone())).await {
+                        eprintln!("Failed to send trades: {}", e);
+                    }
+                }
             }
             Event::KlineReceived(stream_type, kline) => {
                 println!("{} -- Received kline update: {}", stream_type, kline.close,);

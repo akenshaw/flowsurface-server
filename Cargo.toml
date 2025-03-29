@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clickhouse = "0.12.2"
 chrono = "0.4.40"
-questdb-rs = { version = "4.0.4", features = ["chrono_timestamp"] }
 futures.workspace = true
 exchanges.workspace = true
 tokio = { version = "1.44.1", features = ["rt-multi-thread", "signal"] }
@@ -14,6 +14,7 @@ env_logger = "0.11.7"
 toml = "0.5"
 log.workspace = true
 serde.workspace = true
+dotenv = "0.15.0"
 
 [workspace]
 members = [ "exchanges"]
@@ -31,3 +32,6 @@ rust_decimal = "1.36.0"
 uuid = { version = "1.11.0", features = ["v4"] }
 
 exchanges = { version = "0.1.0", path = "exchanges" }
+
+[dev-dependencies]
+clickhouse = { version = "0.12.2", features = ["test-util"] }
