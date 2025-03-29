@@ -7,7 +7,10 @@ use exchanges::{
 use futures::Stream;
 use futures::StreamExt;
 use std::{collections::HashMap, time::Duration};
-use tokio::{sync::mpsc, time::interval};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::interval,
+};
 
 mod config;
 mod server;
@@ -40,46 +43,64 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let client = server::create_client();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (buffer_tx, buffer_rx) = mpsc::channel::<(StreamType, Box<[Trade]>)>(100);
+
     let merged_stream = futures::stream::select_all(streams);
-
-    let mut client = server::create_client();
-
-    let mut tick_to_write = interval(Duration::from_secs(2));
-
-    let (tx, mut rx) = mpsc::channel::<(StreamType, Box<[Trade]>)>(100);
+    let buffer_handle = tokio::spawn(process_trades_buffer(buffer_rx, client, shutdown_rx));
 
     tokio::select! {
-        _ = process_stream(merged_stream, tx) => {},
-        _ = async move {
-            let mut trades_buffer: HashMap<StreamType, Vec<Trade>> = HashMap::new();
-
-            loop {
-                tokio::select! {
-                    Some((stream_type, trades)) = rx.recv() => {
-                        trades_buffer
-                            .entry(stream_type)
-                            .or_insert_with(Vec::new)
-                            .extend(trades);
-                    },
-                    _ = tick_to_write.tick() => {
-                        for (stream_type, trades) in trades_buffer.iter_mut() {
-                            if !trades.is_empty() {
-                                if let Err(e) = server::insert_trades(&mut client, *stream_type, trades).await {
-                                    eprintln!("Error inserting trades: {}", e);
-                                }
-                                trades.clear();
-                            }
-                        }
-                    }
-                }
-            }
-        } => {},
+        _ = process_stream(merged_stream, buffer_tx) => {},
         _ = tokio::signal::ctrl_c() => {
             println!("Received Ctrl+C, shutting down");
+            let _ = shutdown_tx.send(());
         }
     }
 
-    Ok(())
+    match buffer_handle.await {
+        Ok(_) => {
+            println!("Buffer processing finished");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error in buffer processing: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+async fn process_trades_buffer(
+    mut rx: mpsc::Receiver<(StreamType, Box<[Trade]>)>,
+    mut client: clickhouse::Client,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    let mut trades_buffer: HashMap<StreamType, Vec<Trade>> = HashMap::new();
+    let mut tick_to_write = interval(Duration::from_secs(4));
+
+    loop {
+        tokio::select! {
+            Some((stream_type, trades)) = rx.recv() => {
+                trades_buffer
+                    .entry(stream_type)
+                    .or_default()
+                    .extend(trades);
+            },
+            _ = tick_to_write.tick() => {
+                if let Err(e) = server::flush_trades_buffer(&mut client, &mut trades_buffer).await {
+                    eprintln!("Error flushing trades buffer: {}", e);
+                }
+            }
+            _ = &mut shutdown_rx => {
+                println!("Buffer task received shutdown signal");
+                if let Err(e) = server::flush_trades_buffer(&mut client, &mut trades_buffer).await {
+                    eprintln!("Error flushing trades buffer during shutdown: {}", e);
+                }
+                break;
+            }
+        }
+    }
 }
 
 async fn process_stream<S>(mut stream: S, tx: mpsc::Sender<(StreamType, Box<[Trade]>)>)

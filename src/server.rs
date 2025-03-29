@@ -1,14 +1,12 @@
-use std::env;
-
+use clickhouse::sql::Identifier;
+use clickhouse::{Client, Row, error::Result};
 use exchanges::Trade;
 use exchanges::adapter::StreamType;
 use serde::{Deserialize, Serialize};
-
-use clickhouse::sql::Identifier;
-use clickhouse::{Client, Row, error::Result};
+use std::collections::HashMap;
 
 fn read_env_var(key: &str) -> String {
-    env::var(key).unwrap_or_else(|_| panic!("{key} env variable should be set"))
+    std::env::var(key).unwrap_or_else(|_| panic!("{key} env variable should be set"))
 }
 
 pub fn create_client() -> Client {
@@ -35,7 +33,7 @@ const TABLE_SCHEMA: &str = "
 ";
 
 #[derive(Debug, Serialize, Deserialize, Row)]
-pub struct TradeData {
+struct TradeData {
     timestamp: u64,
     exchange: String,
     symbol: String,
@@ -44,25 +42,27 @@ pub struct TradeData {
     is_buyer_maker: bool,
 }
 
-pub async fn insert_trades(
-    client: &mut Client,
-    stream_type: StreamType,
-    trades: &[Trade],
-) -> Result<()> {
+async fn get_inserter(client: &mut Client) -> Result<clickhouse::insert::Insert<TradeData>> {
     client
         .query(TABLE_SCHEMA)
         .bind(Identifier(TABLE_NAME))
         .execute()
         .await?;
 
-    let mut insert = client.insert(TABLE_NAME)?;
+    client.insert(TABLE_NAME)
+}
 
+async fn write_buffer(
+    inserter: &mut clickhouse::insert::Insert<TradeData>,
+    stream_type: &StreamType,
+    trades: &[Trade],
+) -> Result<()> {
     if let StreamType::DepthAndTrades { exchange, ticker } = stream_type {
         let symbol = ticker.to_string();
         let exchange = exchange.to_string();
 
         for trade in trades {
-            insert
+            inserter
                 .write(&TradeData {
                     timestamp: trade.time,
                     exchange: exchange.clone(),
@@ -75,7 +75,22 @@ pub async fn insert_trades(
         }
     }
 
-    insert.end().await?;
+    Ok(())
+}
 
+pub async fn flush_trades_buffer(
+    client: &mut clickhouse::Client,
+    trades_buffer: &mut HashMap<StreamType, Vec<Trade>>,
+) -> anyhow::Result<()> {
+    let mut inserter = get_inserter(client).await?;
+
+    for (stream_type, trades) in trades_buffer.iter_mut() {
+        if !trades.is_empty() {
+            write_buffer(&mut inserter, stream_type, trades).await?;
+            trades.clear();
+        }
+    }
+
+    inserter.end().await?;
     Ok(())
 }

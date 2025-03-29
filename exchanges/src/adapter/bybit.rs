@@ -324,8 +324,8 @@ pub fn connect_market_stream(
         let mut orderbooks: HashMap<Ticker, LocalDepthCache> = HashMap::new();
 
         for ticker in &tickers {
-            trades_buffers.insert(ticker.clone(), Vec::new());
-            orderbooks.insert(ticker.clone(), LocalDepthCache::new());
+            trades_buffers.insert(*ticker, Vec::new());
+            orderbooks.insert(*ticker, LocalDepthCache::new());
         }
 
         loop {

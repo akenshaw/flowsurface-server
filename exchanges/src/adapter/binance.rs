@@ -312,8 +312,8 @@ pub fn connect_market_stream(
         let mut orderbooks: HashMap<Ticker, (LocalDepthCache, bool, u64)> = HashMap::new();
 
         for ticker in &tickers {
-            trades_buffers.insert(ticker.clone(), Vec::new());
-            orderbooks.insert(ticker.clone(), (LocalDepthCache::new(), false, 0));
+            trades_buffers.insert(*ticker, Vec::new());
+            orderbooks.insert(*ticker, (LocalDepthCache::new(), false, 0));
         }
 
         let domain = match market {
