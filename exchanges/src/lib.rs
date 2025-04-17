@@ -120,7 +120,7 @@ impl Ticker {
         assert!(
             ticker
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
             "Invalid character in ticker: {ticker:?}"
         );
 
@@ -132,6 +132,7 @@ impl Ticker {
                 b'0'..=b'9' => c - b'0',
                 b'A'..=b'Z' => c - b'A' + 10,
                 b'_' => 36,
+                b'-' => 37,
                 _ => unreachable!(),
             };
             let shift = (i % 10) * 6;
@@ -154,6 +155,7 @@ impl Ticker {
                 0..=9 => (b'0' + value as u8) as char,
                 10..=35 => (b'A' + (value as u8 - 10)) as char,
                 36 => '_',
+                37 => '-',
                 _ => unreachable!(),
             };
             result.push(c);
@@ -171,6 +173,7 @@ impl fmt::Display for Ticker {
                 0..=9 => (b'0' + value as u8) as char,
                 10..=35 => (b'A' + (value as u8 - 10)) as char,
                 36 => '_',
+                37 => '-',
                 _ => unreachable!(),
             };
             f.write_char(c)?;

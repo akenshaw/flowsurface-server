@@ -3,3 +3,4 @@
 /config
 /.cargo
 .env
+logs

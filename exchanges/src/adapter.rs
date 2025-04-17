@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod binance;
 pub mod bybit;
+pub mod coinbase;
 
 use futures::channel::mpsc;
 use futures::stream::{self, Stream, StreamExt};
@@ -98,6 +99,7 @@ pub enum Exchange {
     BybitLinear,
     BybitInverse,
     BybitSpot,
+    CoinbaseSpot,
 }
 
 impl std::fmt::Display for Exchange {
@@ -112,6 +114,7 @@ impl std::fmt::Display for Exchange {
                 Exchange::BybitLinear => "Bybit Linear",
                 Exchange::BybitInverse => "Bybit Inverse",
                 Exchange::BybitSpot => "Bybit Spot",
+                Exchange::CoinbaseSpot => "Coinbase Spot",
             }
         )
     }
@@ -131,7 +134,9 @@ impl Exchange {
         match self {
             Exchange::BinanceLinear | Exchange::BybitLinear => MarketType::LinearPerps,
             Exchange::BinanceInverse | Exchange::BybitInverse => MarketType::InversePerps,
-            Exchange::BinanceSpot | Exchange::BybitSpot => MarketType::Spot,
+            Exchange::BinanceSpot | Exchange::BybitSpot | Exchange::CoinbaseSpot => {
+                MarketType::Spot
+            }
         }
     }
 
@@ -185,6 +190,7 @@ pub async fn fetch_ticker_info(
         Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
             bybit::fetch_ticksize(market_type).await
         }
+        Exchange::CoinbaseSpot => coinbase::fetch_ticksize(market_type).await,
     }
 }
 
@@ -200,6 +206,7 @@ pub async fn fetch_ticker_prices(
         Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
             bybit::fetch_ticker_prices(market_type).await
         }
+        Exchange::CoinbaseSpot => coinbase::fetch_ticker_prices(market_type).await,
     }
 }
 
@@ -216,6 +223,7 @@ pub async fn fetch_klines(
         Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
             bybit::fetch_klines(ticker, timeframe, range).await
         }
+        Exchange::CoinbaseSpot => coinbase::fetch_klines(ticker, timeframe, range).await,
     }
 }
 

@@ -2,7 +2,7 @@ use config::{Config, setup_exchange_streams};
 use dotenv::dotenv;
 use exchanges::{
     Trade,
-    adapter::{Event, StreamType, binance, bybit},
+    adapter::{Event, StreamType, binance, bybit, coinbase},
 };
 use futures::{Stream, StreamExt};
 use std::{collections::HashMap, time::Duration};
@@ -12,11 +12,14 @@ use tokio::{
 };
 
 mod config;
+mod logger;
 mod server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
+
+    logger::setup(false).expect("Failed to set up logger");
 
     let config: Config =
         Config::from_file("./config/tickers.toml").expect("Failed to load config file");
@@ -33,6 +36,11 @@ async fn main() -> anyhow::Result<()> {
             "bybit" => {
                 setup_exchange_streams(exchange_config, &mut streams, bybit::connect_market_stream)?
             }
+            "coinbase" => setup_exchange_streams(
+                exchange_config,
+                &mut streams,
+                coinbase::connect_market_stream,
+            )?,
             _ => println!("Unknown exchange: {}", exchange_name),
         }
     }
@@ -109,7 +117,7 @@ where
             Event::Disconnected(exchange, reason) => {
                 println!("Disconnected from {}: {}", exchange, reason);
             }
-            Event::DepthReceived(stream_type, _, _, trades) => {
+            Event::DepthReceived(stream_type, _, depth, trades) => {
                 if !trades.is_empty() {
                     if let Err(e) = tx.send((*stream_type, trades.clone())).await {
                         eprintln!("Failed to send trades: {}", e);
